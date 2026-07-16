@@ -15,6 +15,8 @@ from main import (
     save_output,
     cleanup_temp_files
 )
+# Import our brand-new vertical clipping function from clipper.py
+from clipper import create_video_clip
 from config import OUTPUT_DIR
 
 # Set up page configurations
@@ -114,8 +116,6 @@ if uploaded_file is not None:
                 st.stop()
             finally:
                 cleanup_temp_files()
-                if os.path.exists(temp_video_path):
-                    os.remove(temp_video_path)
 
 # Show results if they exist in the session state
 if "generated_content" in st.session_state:
@@ -158,3 +158,47 @@ if "generated_content" in st.session_state:
             # Safe Fallback if the regex parser doesn't find matches
             st.info("Direct Copy Block:")
             st.code(raw_copy, language="markdown")
+
+    # 🎬 SECTION: Vertical Short Video Generator
+    st.markdown("---")
+    st.subheader("🎬 Generate Vertical Short Video Clip")
+    st.markdown("Select your start time and choose how long you want your cropped 9:16 mobile video to be.")
+    
+    video_col1, video_col2 = st.columns([1, 1])
+    
+    with video_col1:
+        st.markdown("#### Clip Configuration")
+        # Start Time numeric input
+        start_sec = st.number_input("Start Time (seconds):", min_value=0, value=0, step=1)
+        # Duration slider
+        clip_duration = st.slider("Clip Duration (seconds):", min_value=5, max_value=60, value=15, step=1)
+        
+        if st.button("✂️ Slice and Crop Video", type="primary"):
+            temp_video_path = os.path.join(OUTPUT_DIR, "temp_uploaded_video.mp4")
+            if os.path.exists(temp_video_path):
+                with st.spinner("Processing video layers... Rendering vertical 9:16 format..."):
+                    generated_clip_path = create_video_clip(temp_video_path, start_time=start_sec, duration=clip_duration)
+                    if generated_clip_path and os.path.exists(generated_clip_path):
+                        st.session_state["generated_clip_path"] = generated_clip_path
+                        st.success("Vertical video clip generated successfully!")
+                    else:
+                        st.error("Failed to process the video clip.")
+            else:
+                st.error("Uploaded video file source not found. Please upload your video file first.")
+
+    with video_col2:
+        st.markdown("#### Clip Preview")
+        if "generated_clip_path" in st.session_state and os.path.exists(st.session_state["generated_clip_path"]):
+            # Preview player directly in-browser
+            st.video(st.session_state["generated_clip_path"])
+            
+            # Browser native download button
+            with open(st.session_state["generated_clip_path"], "rb") as file:
+                st.download_button(
+                    label="📥 Download Vertical Video",
+                    data=file,
+                    file_name=os.path.basename(st.session_state["generated_clip_path"]),
+                    mime="video/mp4"
+                )
+        else:
+            st.info("Your cropped vertical video will show up here as soon as it is generated.")

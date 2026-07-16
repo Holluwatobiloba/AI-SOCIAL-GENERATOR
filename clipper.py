@@ -1,6 +1,15 @@
 import os
-from moviepy.editor import VideoFileClip
 from config import OUTPUT_DIR
+
+# Robust MoviePy import fallback structure to support both v1.x and v2.x releases
+try:
+    from moviepy.editor import VideoFileClip
+except ImportError:
+    try:
+        from moviepy.video.io.VideoFileClip import VideoFileClip
+    except ImportError as e:
+        print("❌ Critical: MoviePy is not installed correctly in this virtual environment.")
+        raise e
 
 def crop_to_vertical(clip):
     """
