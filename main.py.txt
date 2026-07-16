@@ -1,0 +1,340 @@
+import os
+import sys
+import json
+import re
+import subprocess
+from datetime import datetime
+import whisper
+import torch  # Limits CPU thread utilization to prevent system crashes
+import requests
+from config import *
+
+# Force PyTorch/Whisper to limit its CPU usage to 4 threads
+torch.set_num_threads(4)
+
+def extract_json_from_text(raw_text: str) -> dict:
+    """
+    Takes a raw structured text response from the model and safely
+    parses it into a clean python dictionary.
+    """
+    if not raw_text:
+        return {}
+
+    # Initialize our structured dictionary with empty lists/strings
+    parsed_data = {
+        "key_ideas": [],
+        "best_moments": [],
+        "emotional_peaks": [],
+        "hooks": [],
+        "quotes": [],
+        "summary": ""
+    }
+
+    # Helper function to extract content between custom square tags
+    def extract_section(tag, text):
+        pattern = rf"\[{tag}\](.*?)(?=\[\w+\]|$)"
+        match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+        if match:
+            lines = match.group(1).strip().split("\n")
+            # Clean up bullet points, numbers, and empty lines
+            cleaned_lines = []
+            for line in lines:
+                cleaned = re.sub(r'^[-\*\d\.\s]+', '', line).strip()
+                if cleaned:
+                    cleaned_lines.append(cleaned)
+            return cleaned_lines
+        return []
+
+    # Parse sections sequentially
+    parsed_data["key_ideas"] = extract_section("KEY_IDEAS", raw_text)
+    parsed_data["best_moments"] = extract_section("BEST_MOMENTS", raw_text)
+    parsed_data["emotional_peaks"] = extract_section("EMOTIONAL_PEAKS", raw_text)
+    parsed_data["hooks"] = extract_section("HOOKS", raw_text)
+    parsed_data["quotes"] = extract_section("QUOTES", raw_text)
+    
+    # Extract summary as a single string
+    summary_list = extract_section("SUMMARY", raw_text)
+    if summary_list:
+        parsed_data["summary"] = summary_list[0]
+        
+    return parsed_data
+
+def extract_audio(video_file):
+    """Extract audio from video using FFmpeg"""
+    print(f"🎬 Extracting audio from: {video_file}")
+    
+    audio_file = os.path.join(OUTPUT_DIR, "temp_audio.wav")
+    
+    try:
+        command = [
+            "ffmpeg",
+            "-i", video_file,
+            "-q:a", "9",
+            "-n",
+            audio_file
+        ]
+        
+        result = subprocess.run(command, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            print(f"✅ Audio extracted: {audio_file}")
+            return audio_file
+        else:
+            print(f"❌ FFmpeg error: {result.stderr}")
+            return None
+    except Exception as e:
+        print(f"❌ Audio extraction error: {e}")
+        return None
+
+def transcribe_audio(audio_file):
+    """Convert audio to text using Whisper"""
+    print(f"🎤 Transcribing audio...")
+    print(f"⏳ This may take 1-5 minutes depending on video length...\n")
+    
+    try:
+        model = whisper.load_model(WHISPER_MODEL, device=WHISPER_DEVICE)
+        result = model.transcribe(audio_file)
+        transcript = result["text"]
+        print(f"✅ Transcription complete: {len(transcript)} characters\n")
+        return transcript
+    except Exception as e:
+        print(f"❌ Transcription error: {e}")
+        return None
+
+def analyze_content(transcript):
+    """Analyze transcript using plain-text delimited tags - optimized for llama3.2 on CPU"""
+    analysis_model = "llama3.2:3b"
+    
+    print(f"🔍 Analyzing content with {analysis_model}...")
+    print(f"⏳ Processing text extraction...\n")
+    
+    # Simple structured instruction template with zero placeholders to prevent instruction copying
+    prompt = f"""You are a content analyzer. Analyze the transcription text below and fill in the bracketed headers using ONLY facts and direct quotes from the text. Do not make up stories or mention external people.
+
+TRANSCRIPTION TEXT:
+"{transcript}"
+
+Provide your analysis by writing 1 or 2 lines directly below each header. Do not write anything else.
+
+[KEY_IDEAS]
+- 
+
+[BEST_MOMENTS]
+- 
+
+[EMOTIONAL_PEAKS]
+- 
+
+[HOOKS]
+- 
+
+[QUOTES]
+- 
+
+[SUMMARY]
+"""
+    
+    try:
+        print("📡 Sending analysis request to Ollama...\n")
+        response = requests.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={
+                "model": analysis_model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.1  # Highly factual setting to prevent hallucinations
+                }
+            },
+            timeout=900
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            analysis_text = result.get("response", "")
+            print(f"✅ Analysis complete\n")
+            
+            # Parse the structured flat-text into our clean JSON dictionary
+            analysis = extract_json_from_text(analysis_text)
+            return analysis
+        else:
+            print(f"❌ Ollama error: HTTP {response.status_code}")
+            return None
+    except requests.exceptions.Timeout:
+        print(f"❌ Request timed out during analysis phase")
+        return None
+    except requests.exceptions.ConnectionError:
+        print(f"❌ Cannot connect to Ollama")
+        return None
+    except Exception as e:
+        print(f"❌ Analysis error: {e}")
+        return None
+
+def generate_content(transcript):
+    """Generate social media content using Ollama - Explicitly routed to llama3.2 for smart copy"""
+    generation_model = "llama3.2:3b"
+    
+    print(f"🤖 Generating content with {generation_model}...")
+    print(f"⏳ This will be fast on your CPU...\n")
+    
+    prompt = f"""Create 4 short social media posts from this text:
+{transcript}
+
+Post 1 - Twitter (max 280 chars):
+Post 2 - Instagram (max 2200 chars):
+Post 3 - LinkedIn (max 3000 chars):
+Post 4 - TikTok (max 150 chars):"""
+    
+    try:
+        print("📡 Sending request to Ollama...\n")
+        response = requests.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={
+                "model": generation_model,
+                "prompt": prompt,
+                "stream": False
+            },
+            timeout=900
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            content = result.get("response", "")
+            print(f"✅ Content generated: {len(content)} characters\n")
+            return content
+        else:
+            print(f"❌ Ollama error: HTTP {response.status_code}")
+            return None
+    except requests.exceptions.Timeout:
+        print(f"❌ Request timed out during content generation phase")
+        return None
+    except requests.exceptions.ConnectionError:
+        print(f"❌ Cannot connect to Ollama")
+        return None
+    except Exception as e:
+        print(f"❌ Generation error: {e}")
+        return None
+
+def save_transcript(transcript, video_file):
+    """Save transcript to file"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    transcript_file = os.path.join(OUTPUT_DIR, f"transcript_{timestamp}.txt")
+    with open(transcript_file, "w", encoding="utf-8") as f:
+        f.write(f"VIDEO: {video_file}\n")
+        f.write(f"DATE: {timestamp}\n")
+        f.write(f"LENGTH: {len(transcript)} characters\n\n")
+        f.write(f"TRANSCRIPT:\n{transcript}\n")
+    
+    print(f"✅ Transcript saved: {transcript_file}\n")
+    return transcript_file
+
+def save_analysis(analysis, video_file, timestamp):
+    """Save analysis to JSON file"""
+    analysis_file = os.path.join(OUTPUT_DIR, f"analysis_{timestamp}.json")
+    with open(analysis_file, "w", encoding="utf-8") as f:
+        json.dump(analysis, f, indent=2, ensure_ascii=False)
+    
+    print(f"✅ Analysis saved: {analysis_file}\n")
+    return analysis_file
+
+def save_output(transcript, analysis, content, video_file):
+    """Save all results to file"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Save as JSON (complete)
+    output_data = {
+        "timestamp": timestamp,
+        "video_file": video_file,
+        "transcript": transcript,
+        "analysis": analysis,
+        "generated_content": content
+    }
+    
+    json_file = os.path.join(OUTPUT_DIR, f"complete_output_{timestamp}.json")
+    with open(json_file, "w", encoding="utf-8") as f:
+        json.dump(output_data, f, indent=2, ensure_ascii=False)
+    
+    # Save as TXT (readable)
+    txt_file = os.path.join(OUTPUT_DIR, f"complete_output_{timestamp}.txt")
+    with open(txt_file, "w", encoding="utf-8") as f:
+        f.write(f"VIDEO: {video_file}\n")
+        f.write(f"DATE: {timestamp}\n\n")
+        f.write(f"TRANSCRIPT:\n{transcript}\n\n")
+        f.write(f"ANALYSIS:\n{json.dumps(analysis, indent=2, ensure_ascii=False)}\n\n")
+        f.write(f"GENERATED SOCIAL POSTS:\n{content}\n")
+    
+    print(f"✅ Complete output saved:")
+    print(f"   - {json_file}")
+    print(f"   - {txt_file}\n")
+    return json_file, txt_file
+
+def cleanup_temp_files():
+    """Remove temporary audio file"""
+    temp_audio = os.path.join(OUTPUT_DIR, "temp_audio.wav")
+    if os.path.exists(temp_audio):
+        os.remove(temp_audio)
+        print(f"✅ Cleaned up temporary files\n")
+
+def main():
+    """Main workflow"""
+    print("=" * 60)
+    print("🚀 AI Social Media Content Generator")
+    print("=" * 60)
+    print()
+    
+    # VIDEO FILE PATH (Dynamic Terminal Input)
+    print("📋 Please enter or paste the full path to your video file.")
+    video_file = input("👉 Video Path: ").strip().strip('"')
+    print()
+    
+    # Check if file exists
+    if not os.path.exists(video_file):
+        print(f"❌ Video file not found: {video_file}")
+        return
+    
+    print(f"📹 Processing: {video_file}\n")
+    
+    # Step 1: Extract audio
+    audio_file = extract_audio(video_file)
+    if not audio_file:
+        print("❌ Failed to extract audio")
+        return
+    
+    # Step 2: Transcribe
+    transcript = transcribe_audio(audio_file)
+    if not transcript:
+        print("❌ Failed to transcribe")
+        cleanup_temp_files()
+        return
+    
+    # Step 3: Save transcript
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_transcript(transcript, video_file)
+    
+    # Step 4: Analyze content (NEW - Phase 3)
+    analysis = analyze_content(transcript)
+    if analysis:
+        save_analysis(analysis, video_file, timestamp)
+    else:
+        print("⚠️  Analysis failed, continuing anyway\n")
+    
+    # Step 5: Generate content
+    content = generate_content(transcript)
+    
+    # Step 6: Save all results
+    if content and analysis:
+        save_output(transcript, analysis, content, video_file)
+        print("=" * 60)
+        print("✅ Phase 3 & 4 Validation Complete! Check output/ for results")
+        print("=" * 60)
+    else:
+        print("=" * 60)
+        print("⚠️  Some steps failed (transcript was saved)")
+        print("=" * 60)
+    
+    # Cleanup
+    cleanup_temp_files()
+
+if __name__ == "__main__":
+    main()
